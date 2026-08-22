@@ -1,0 +1,19 @@
+# --- Secrets ------------------------------------------------------------------
+# Real credentials (Neon, GitHub token, LLM key) live in .env — never commit.
+.env
+
+# --- Python -------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# --- OS / editor artifacts ----------------------------------------------------
+.DS_Store
+*:Zone.Identifier
+.idea/
+.vscode/
