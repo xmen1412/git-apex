@@ -149,6 +149,41 @@ services:
       timeout: 5s
       retries: 10
 
+  # ---------------------------------------------------------------------------
+  # Stream processor - Kafka consumer -> diff enrichment -> 4 sinks.
+  # Image: build once with `docker build -t commit-pulse-app .` (or compose --build).
+  # Code is bind-mounted so edits apply on restart without a rebuild.
+  # NOTE: compose strips quotes from .env values (docker run --env-file does NOT) —
+  # the quoted POSTGRES_POOLED_URL is safe here.
+  # ---------------------------------------------------------------------------
+  processor:
+    image: commit-pulse-app:latest
+    build:
+      context: .
+    container_name: cp-processor
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      chroma:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MINIO_ENDPOINT: http://minio:9000
+      CLICKHOUSE_HOST: clickhouse
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command: python -m services.processor
+    restart: unless-stopped
+
 volumes:
   kafka-data:
   minio-data:
