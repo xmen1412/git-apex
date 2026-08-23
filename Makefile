@@ -1,4 +1,4 @@
-.PHONY: up down logs ps schema verify reset
+.PHONY: up down logs ps schema verify reset watch-repos watch-repos-dry-run
 
 up:
 	docker compose up -d
@@ -43,3 +43,13 @@ verify:
 reset:
 	docker compose down -v
 	docker compose up -d
+
+# Registers the webhook on every repo GITHUB_TOKEN can administer, pointed at
+# GITHUB_WEBHOOK_URL. Idempotent — re-run after creating new repos. Requires
+# `up` to be running (uses the same image, no separate build).
+watch-repos:
+	docker compose run --rm --no-deps webhook python services/watch_repos.py
+
+# Preview what watch-repos would do without registering anything.
+watch-repos-dry-run:
+	docker compose run --rm --no-deps webhook python services/watch_repos.py --dry-run

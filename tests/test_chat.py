@@ -29,6 +29,7 @@ def make_settings() -> Settings:
         chroma_collection="commits",
         github_token="",
         github_webhook_secret="",
+        github_webhook_url="",
         llm_base_url="https://llm.example/v1",
         llm_api_key="sk-test",
         llm_model="test-model",

@@ -92,18 +92,46 @@ without a rebuild. Rebuild only when `requirements.txt` changes:
 Feed it data, either live or historical:
 
 ```bash
-# live: point a GitHub webhook at http://localhost:8000 (via smee.io for localhost)
 # historical: backfill N commits from any public repo (one-off container)
 docker compose run --rm --no-deps \
-  -e KAFKA_BOOTSTRAP_SERVERS=kafka:29092 \
   processor python services/backfill.py octocat/Hello-World --limit 20 --delay 1
 ```
+
+### Auto-watch all your repos (live ingestion)
+
+A GitHub token can read any repo it's granted access to, but GitHub webhooks
+are still per-repository — nothing "just works" across your whole account
+without registering a hook on each repo. `make watch-repos` does that
+registration for you, once, for every repo the token can administer:
+
+```bash
+# .env needs: GITHUB_TOKEN (repo scope), GITHUB_WEBHOOK_SECRET,
+# GITHUB_WEBHOOK_URL (a public URL GitHub can POST to — see below)
+make watch-repos-dry-run   # preview: what would be registered/skipped
+make watch-repos           # actually register (idempotent, safe to re-run)
+```
+
+This box has no public IP, so `GITHUB_WEBHOOK_URL` points at a
+[smee.io](https://smee.io/new) channel, and the `smee` compose service tunnels
+it to `webhook:8000/webhook` continuously (started by `docker compose up -d`
+along with everything else — no separate `npx smee-client` terminal to keep
+open). Push to any repo it registered and it flows straight into Kafka →
+processor → all 4 sinks, same as the manually-wired repo from Phase 1.
+
+Behavior:
+- Skips repos where the token isn't an admin (can't manage webhooks there —
+  e.g. repos you collaborate on but don't own).
+- Skips forks by default (`--include-forks` to opt in).
+- Skips repos that already have a hook pointed at the same URL — re-running
+  after creating a new repo only touches the new one.
+- If you deploy the receiver somewhere with a real public URL instead of
+  using smee, set `GITHUB_WEBHOOK_URL` to that and skip the `smee` tunnel.
 
 Try it: `curl -X POST http://localhost:8002/chat -H 'Content-Type: application/json' -d '{"question": "most active author?"}'` — the response includes the
 route, the router's reasoning, the raw data, and the natural-language answer.
 Or open the dashboard at http://localhost:8501.
 
-Run tests: `docker run --rm -e PYTHONPATH=/app -v "$PWD:/app" commit-pulse-app sh -c "pip install -q pytest && python -m pytest tests/ -q"`
+Run tests: `docker compose run --rm --no-deps webhook python -m pytest tests/ -q`
 
 ## Stack notes
 
@@ -130,6 +158,7 @@ cold-start on the first query after a pause. Worth knowing before a live demo.
 | Webhook receiver | 8000 | |
 | Chat backend | 8002 | |
 | Streamlit dashboard | 8501 | |
+| smee tunnel | *(none)* | internal only — relays `GITHUB_WEBHOOK_URL` to `webhook:8000` |
 
 ### Schema init caveat
 
@@ -141,7 +170,7 @@ explicit `ALTER` statements against Neon.
 ## Improvements so far
 
 Hardening done after the first end-to-end demo, all covered by tests
-(`tests/test_chat.py`, 20 tests):
+(`tests/test_chat.py` + `tests/test_repo_watcher.py`, 32 tests):
 
 - **Router output parsing** — the Zen API wraps JSON in ```` ```json ````
   fences even with `response_format: json_object`; `_parse_json_object()`
@@ -166,6 +195,12 @@ Hardening done after the first end-to-end demo, all covered by tests
 - **One-command stack** — webhook, processor, chat, and dashboard are all
   `docker compose` services (`docker compose up -d`), replacing the manual
   `docker run` commands.
+- **Auto-watch all repos** — a token can *read* any repo it's granted, but
+  webhooks are still per-repo; `make watch-repos` registers the webhook on
+  every repo the token administers (skips forks/no-admin/already-registered),
+  and a persistent `smee` tunnel service replaces the manual `npx
+  smee-client` terminal. Pushing to any of the 14 registered repos now flows
+  into the pipeline without touching GitHub settings by hand.
 
 ## Known limitations / future improvements
 

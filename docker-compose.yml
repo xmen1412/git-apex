@@ -272,6 +272,29 @@ services:
     command: streamlit run services/dashboard.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # smee.io tunnel - relays GITHUB_WEBHOOK_URL (public) -> webhook:8000/webhook
+  # (this box has no public IP). Runs continuously so every repo watched via
+  # `make watch-repos` actually reaches the receiver, not just the one repo
+  # that was wired up manually in Phase 1. Not needed if you deploy the
+  # webhook receiver somewhere with a real public URL instead.
+  # ---------------------------------------------------------------------------
+  smee:
+    image: node:20-alpine
+    container_name: cp-smee
+    depends_on:
+      - webhook
+    environment:
+      SMEE_URL: ${GITHUB_WEBHOOK_URL}
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      if [ -z \"$$SMEE_URL\" ]; then echo 'GITHUB_WEBHOOK_URL not set, smee tunnel idle' && sleep infinity; fi
+      npm install -g smee-client >/dev/null 2>&1
+      exec smee --url \"$$SMEE_URL\" --target http://webhook:8000/webhook
+      "
+    restart: unless-stopped
+
 volumes:
   kafka-data:
   minio-data:

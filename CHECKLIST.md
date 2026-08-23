@@ -52,6 +52,18 @@ Catatan: kode Fase 1 tervalidasi end-to-end via container `commit-pulse-app` (ho
 
 Catatan: channel smee `https://smee.io/bQTW1EdtYfVr0cZx`; push dummy tervalidasi sampai `POST /webhook` dan mendapat response `200 OK`.
 
+### 1.5 Auto-watch semua repo (post-Fase 2, ditambah atas permintaan user)
+- [x] `commit_pulse/repo_watcher.py` — pure logic: `should_skip_repo` (skip archived/disabled/fork kecuali `--include-forks`/tanpa admin), `find_matching_hook`, `build_hook_payload`
+- [x] `commit_pulse/github_client.py` +`list_user_repos` (paginated `/user/repos`), `list_repo_hooks`, `create_repo_hook`
+- [x] `commit_pulse/config.py` +`github_webhook_url` (env `GITHUB_WEBHOOK_URL`)
+- [x] `services/watch_repos.py` — CLI, idempotent, `--dry-run`, `--include-forks`, `--affiliation`
+- [x] `smee` service baru di `docker-compose.yml` (node:20-alpine + smee-client, tunnel persisten `GITHUB_WEBHOOK_URL` → `webhook:8000/webhook`, tidak perlu `npx` manual lagi)
+- [x] `make watch-repos` / `make watch-repos-dry-run`
+- [x] `tests/test_repo_watcher.py` (12 test, total 32)
+- [x] `pytest` dipindah dari ad-hoc `pip install` ke `requirements.txt`
+
+Catatan: dijalankan live dengan token `xmen1412` — 19 repo terdeteksi, 14 didaftarkan, 1 sudah ada (`Hello-World`), 4 fork di-skip, 2 repo kolaborator tanpa admin di-skip (`dwikylaga1/Tool-Store-Pintar`, `yohanesam/sentiment-analysis-project`). Ditemukan hook basi peninggalan sebelumnya di `xmen1412/oop` mengarah ke placeholder `https://example.com/webhook` (502) — dihapus manual via API. Verifikasi E2E: GitHub ping event → smee → `cp-smee` → `cp-webhook` → `200 OK`. Re-run kedua idempoten (15/15 "already watching").
+
 ## Fase 2 — AI & Demo
 
 Prasyarat: Fase 0 + Fase 1 selesai (data sudah di 4 sink).
