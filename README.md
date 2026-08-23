@@ -1,98 +1,187 @@
-# commit-pulse — infra
+# commit-pulse
 
-Local infrastructure for the GitHub commit analytics pipeline described in
-`ADR-001`. This is **infra only** — no application services yet.
+Ask plain-language questions about a GitHub repo's commit history — *"who
+changed `auth.py`?"*, *"most active author this month?"*, *"commits related
+to rate limiting"* — and watch an LLM router pick the right datastore to
+answer each one.
 
-## Why this stack
+Built as a portfolio piece under `xmen1412/git-apex`. See
+`ADR-001-commit-analytics-pipeline.md` for the full design rationale and
+`CHECKLIST.md` for the phased roadmap.
 
-A commit event fans out to four stores, each answering a different kind of question:
+## Would I actually build it this way at this scale?
 
-| Service | Holds | Answers |
-|---|---|---|
-| Kafka | `raw-commits` topic | decouples ingest from processing; same topic for webhook + backfill |
-| MinIO | raw webhook JSON | source of truth for reprocessing if a schema changes |
-| PostgreSQL (Neon) | `commits`, `authors`, `files_changed` (incl. diff patch text) | "who changed X", "show commits in repo Y" |
-| ClickHouse | `commit_metrics` | "commits per day", "most active author", churn trends |
-| Chroma | commit embeddings | "commits related to auth refactoring" (semantic) |
+**No — and that's the point.** For 1–3 personal repos, a single Postgres
+(with `pgvector` for embeddings) would answer every question above with a
+fraction of the moving parts. This fan-out is deliberately broader than the
+workload requires: it exists to demonstrate, end-to-end, the *patterns* a
+real analytics system uses when each store answers a different kind of
+question — event streaming, raw-payload archiving, relational lookups,
+columnar aggregation, and vector search — glued together by an LLM router
+that must justify its choice on every query. Treat it as a breadth-of-
+demonstration artifact, not a scale recommendation.
 
-This fan-out is deliberately broader than 1–3 personal repos require — see the
-trade-off section of the ADR.
+## Architecture
 
-**Scope note:** commits only, no PRs (for now). Diff content is included —
-the `push` webhook payload only lists changed file paths, not diff text, so
-the stream processor makes one follow-up call per commit to
-`GET /repos/{owner}/{repo}/commits/{sha}` to fetch `patch` text and
-per-file `additions`/`deletions`. This is what feeds Chroma's semantic
-search over actual code changes, not just commit messages.
-
-## Setup
-
-Postgres is **not** run locally — this project uses [Neon](https://neon.com)
-(serverless Postgres). Everything else runs in Docker.
-
-```bash
-cp .env.example .env     # fill in POSTGRES_POOLED_URL and POSTGRES_DIRECT_URL from Neon
-make up                  # starts Kafka, MinIO, ClickHouse, Chroma
-make schema              # applies infra/postgres/01-schema.sql to Neon
-make verify              # confirms topics, bucket, and all schemas exist
+```
+            push webhook                backfill (GitHub REST API)
+                  │                             │
+                  ▼                             ▼
+          services/webhook.py ─────────►  Kafka topic `raw-commits`
+          (FastAPI, HMAC verify)                │
+                                                ▼
+                                      services/processor.py
+                                      (diff enrichment via
+                                       GET /repos/.../commits/{sha})
+                                                │
+              ┌───────────────┬─────────────────┼───────────────────┐
+              ▼               ▼                 ▼                   ▼
+            MinIO      Neon Postgres       ClickHouse            Chroma
+          (raw JSON    (commits, authors,  (commit_metrics)   (embeddings:
+          archive,     files_changed                          message+diff,
+          replayable    + patch text)                            all-MiniLM-L6-v2)
+              │               │                 │                   │
+              └───────────────┴────────┬────────┴───────────────────┘
+                                       ▼
+                              services/chat.py
+                    POST /chat: LLM call #1 classifies the question
+                    → relational | analytical | semantic | chained
+                    → safe whitelisted query execution (LLM never
+                      writes SQL) → LLM call #2 summarizes
+                                       ▼
+                            services/dashboard.py
+                    (Streamlit chat UI + routing transparency)
 ```
 
-`make verify` should show: the `raw-commits` topic, the `raw-commits` bucket,
-three Neon Postgres tables, one ClickHouse table, and a Chroma heartbeat.
+| Question type | Routed to | Example |
+|---|---|---|
+| relational | Neon Postgres | "who changed file X", "commits in repo Y" |
+| analytical | ClickHouse | "commits per day", "most active author" |
+| semantic | Chroma | "commits related to auth refactoring" |
+| chained | Chroma → Postgres | "explain what changed in commits about rate limiting" |
 
-`make schema` requires `psql` installed on your machine.
+**Safety:** the router LLM only picks a whitelisted *intent* and fills its
+params. All SQL is hardcoded read-only templates with parameterized values
+(`commit_pulse/query_executors.py`) — no raw LLM-generated SQL ever touches
+a database.
 
-## Neon: pooled vs direct connection
+**Idempotency** (backfill and webhook share one topic, so re-ingestion is
+normal): Postgres `ON CONFLICT (sha) DO NOTHING` · ClickHouse
+`ReplacingMergeTree` ordered by `(repo, sha)` · Chroma `upsert()` by `sha` ·
+MinIO overwrites per-`sha` object.
 
-Neon exposes two connection strings per branch, differing by a `-pooler`
-segment in the hostname. Using the wrong one causes confusing failures:
+## Running the demo
+
+Prereqs: Docker Desktop with WSL integration, a free
+[Neon](https://neon.com) project, a GitHub token, and an OpenCode Zen API
+key.
+
+```bash
+cp .env.example .env    # fill in: Neon URLs, GitHub token/secret, LLM_API_KEY
+docker compose up -d    # EVERYTHING: infra + webhook + processor + chat + dashboard
+make schema             # apply Postgres schema to Neon (first run only)
+make verify             # confirm topic, bucket, tables, heartbeat
+```
+
+All application services (`webhook`, `processor`, `chat`, `dashboard`) are
+compose services built from the shared `commit-pulse-app` image, with the
+repo bind-mounted at `/app` — code edits apply on `docker compose restart`
+without a rebuild. Rebuild only when `requirements.txt` changes:
+`docker compose up -d --build`.
+
+Feed it data, either live or historical:
+
+```bash
+# live: point a GitHub webhook at http://localhost:8000 (via smee.io for localhost)
+# historical: backfill N commits from any public repo (one-off container)
+docker compose run --rm --no-deps \
+  -e KAFKA_BOOTSTRAP_SERVERS=kafka:29092 \
+  processor python services/backfill.py octocat/Hello-World --limit 20 --delay 1
+```
+
+Try it: `curl -X POST http://localhost:8002/chat -H 'Content-Type: application/json' -d '{"question": "most active author?"}'` — the response includes the
+route, the router's reasoning, the raw data, and the natural-language answer.
+Or open the dashboard at http://localhost:8501.
+
+Run tests: `docker run --rm -e PYTHONPATH=/app -v "$PWD:/app" commit-pulse-app sh -c "pip install -q pytest && python -m pytest tests/ -q"`
+
+## Stack notes
+
+Postgres is **not** run locally — it lives in Neon (serverless). Everything
+else is Docker. Neon exposes two connection strings; using the wrong one
+causes confusing failures:
 
 | Use case | String | Why |
 |---|---|---|
 | Stream processor, AI chat (runtime) | `POSTGRES_POOLED_URL` | PgBouncer transaction-mode pooling; handles many short-lived connections |
-| `make schema`, migrations, `psql` | `POSTGRES_DIRECT_URL` | Transaction-mode pooling breaks prepared statements and can time out on large transactions |
+| `make schema`, migrations, `psql` | `POSTGRES_DIRECT_URL` | Pooling breaks prepared statements and large transactions |
 
-Also note Neon's free tier **auto-suspends on idle** — expect a cold-start
-delay of up to a few seconds on the first query after a pause. Worth knowing
-before you demo this live.
+Neon's free tier **auto-suspends on idle** — expect a few seconds of
+cold-start on the first query after a pause. Worth knowing before a live demo.
 
-## Ports (local services only)
+### Ports (local services)
 
 | Service | Host port | Notes |
 |---|---|---|
 | Kafka | 9092 | from host; containers use `kafka:29092` |
-| MinIO API | 9000 | |
-| MinIO console | 9001 | log in with `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` |
-| ClickHouse HTTP | 8123 | |
-| ClickHouse native | 9010 | remapped — 9000 is MinIO's |
-| Chroma | 8001 | remapped — container listens on 8000 |
+| MinIO API / console | 9000 / 9001 | |
+| ClickHouse HTTP / native | 8123 / 9010 | native remapped — 9000 is MinIO's |
+| Chroma | 8001 | container listens on 8000 |
+| Webhook receiver | 8000 | |
+| Chat backend | 8002 | |
+| Streamlit dashboard | 8501 | |
 
-Postgres has no local port — it lives in Neon.
+### Schema init caveat
 
-## Schema init caveat
+ClickHouse init scripts under `infra/clickhouse/` run only on first start
+(empty volume). After editing that schema: `make reset` (**destructive**,
+local volumes only — never touches Neon). Postgres schema changes need
+explicit `ALTER` statements against Neon.
 
-**ClickHouse** init scripts under `infra/clickhouse/` run only on first start,
-when the data volume is empty. After editing that schema:
+## Improvements so far
 
-```bash
-make reset    # DESTRUCTIVE — drops LOCAL volumes only, re-runs ClickHouse init
-```
+Hardening done after the first end-to-end demo, all covered by tests
+(`tests/test_chat.py`, 20 tests):
 
-`make reset` does **not** touch Neon. To change the Postgres schema, edit
-`infra/postgres/01-schema.sql` and re-run `make schema` — note the file uses
-`CREATE TABLE IF NOT EXISTS`, so altering an existing table needs an explicit
-`ALTER` (or drop the tables in Neon first).
+- **Router output parsing** — the Zen API wraps JSON in ```` ```json ````
+  fences even with `response_format: json_object`; `_parse_json_object()`
+  strips fences, and unknown/broken routes fall back to `semantic` instead
+  of crashing.
+- **Intent whitelist** — route+intent pairs are validated against
+  `ROUTE_INTENTS`; an intent the model invents is forced back to the
+  route's default. The LLM only ever picks a template + params, never SQL.
+- **File-path matching** — `commits_by_file` matches `README` against both
+  `README` and `%/README` so questions match paths as stored by GitHub.
+- **No hidden time window** — `commits_per_day` used to silently default
+  to the last 30 days (confusing with old backfilled commits). Now `days`
+  is only applied when the user actually mentions a time range.
+- **`author_email` in ClickHouse** — added to `commit_metrics` (schema,
+  sink, and `most_active_authors` grouping); existing rows backfilled via
+  `ALTER TABLE ... UPDATE` from Neon.
+- **Schema questions** — new `list_tables` intent answers "what tables are
+  in Neon?" from `information_schema`.
+- **Deterministic override** — obvious content questions in Indonesian
+  ("apa isi …", "terkait …") are forced to semantic search instead of a
+  literal filename lookup.
+- **One-command stack** — webhook, processor, chat, and dashboard are all
+  `docker compose` services (`docker compose up -d`), replacing the manual
+  `docker run` commands.
 
-## Idempotency
+## Known limitations / future improvements
 
-Both schemas are designed so re-ingesting the same commit is safe — important
-because backfill and webhook feed the same Kafka topic:
+Notes from a routing-mistake review — deliberately **not fixed yet**, kept
+as a roadmap:
 
-- Postgres: `commits.sha` is the primary key → use `ON CONFLICT (sha) DO NOTHING`
-- ClickHouse: `ReplacingMergeTree` ordered by `sha` → duplicates collapse on merge
-- Chroma: use `upsert()` with `sha` as the document id
-
-## Next
-
-Application services (webhook receiver, stream processor, AI chat, dashboard)
-are not scaffolded yet. See the ADR action items.
+- **Structured Outputs / function calling** — JSON mode guarantees valid
+  JSON, not correct enum values. Constrain `route`/`intent` via a strict
+  schema (needs testing whether Zen supports it for `claude-haiku-4-5`).
+- **Deterministic pre-router** — route obvious patterns ("table/schema
+  Neon", "siapa mengubah file X") with rules *before* calling the LLM;
+  today every question costs an LLM call.
+- **Param validation** — required params per intent (`file_path`, `repo`,
+  `author`, `sha`) should return `needs_clarification` instead of silently
+  falling back to a wrong query.
+- **Semantic file filtering** — Chroma metadata has no `paths` field, so
+  semantic search can't filter by file; add it at index time.
+- **Eval set** — ~20 Indonesian/English questions as a regression suite for
+  routing accuracy.

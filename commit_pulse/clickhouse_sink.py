@@ -27,6 +27,7 @@ class ClickHouseSink:
                 event.repo,
                 event.sha,
                 event.author_username or event.author_email or "unknown",
+                event.author_email,
                 event.committed_at.replace(tzinfo=None),
                 event.message,
                 event.additions,
@@ -34,7 +35,7 @@ class ClickHouseSink:
                 len(event.files),
             ]],
             column_names=[
-                "repo", "sha", "author", "committed_at", "message",
+                "repo", "sha", "author", "author_email", "committed_at", "message",
                 "additions", "deletions", "files_count",
             ],
         )

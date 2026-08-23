@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS commit_metrics
     repo         String,
     sha          String,
     author       String,
+    author_email String DEFAULT '',
     committed_at DateTime,
     message      String,
     additions    UInt32,

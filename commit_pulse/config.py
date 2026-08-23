@@ -42,6 +42,9 @@ class Settings:
     chroma_collection: str
     github_token: str
     github_webhook_secret: str
+    llm_base_url: str
+    llm_api_key: str
+    llm_model: str
 
 
 def get_settings(require_webhook_secret: bool = False) -> Settings:
@@ -67,4 +70,7 @@ def get_settings(require_webhook_secret: bool = False) -> Settings:
         chroma_collection=_optional("CHROMA_COLLECTION", "commits"),
         github_token=os.getenv("GITHUB_TOKEN", "").strip(),
         github_webhook_secret=webhook_secret,
+        llm_base_url=_optional("LLM_BASE_URL", "https://opencode.ai/zen/v1"),
+        llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
+        llm_model=_optional("LLM_MODEL", "claude-haiku-4-5"),
     )

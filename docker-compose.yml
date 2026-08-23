@@ -150,6 +150,31 @@ services:
       retries: 10
 
   # ---------------------------------------------------------------------------
+  # Webhook receiver - GitHub push events -> HMAC verify -> Kafka raw-commits.
+  # Expose it through a tunnel (e.g. smee.io) when wiring a real GitHub webhook.
+  # ---------------------------------------------------------------------------
+  webhook:
+    image: commit-pulse-app:latest
+    build:
+      context: .
+    container_name: cp-webhook
+    depends_on:
+      kafka:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      PYTHONPATH: /app
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command: uvicorn services.webhook:create_app --factory --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
   # Stream processor - Kafka consumer -> diff enrichment -> 4 sinks.
   # Image: build once with `docker build -t commit-pulse-app .` (or compose --build).
   # Code is bind-mounted so edits apply on restart without a rebuild.
@@ -182,6 +207,69 @@ services:
       - ./:/app
     working_dir: /app
     command: python -m services.processor
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # AI chat backend - POST /chat: LLM router -> safe query execution -> answer.
+  # Host port 8002 -> container 8000 (8000 on the host is the webhook receiver).
+  # ---------------------------------------------------------------------------
+  chat:
+    image: commit-pulse-app:latest
+    build:
+      context: .
+    container_name: cp-chat
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      chroma:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+      PYTHONPATH: /app
+    ports:
+      - "8002:8000"
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command: uvicorn services.chat:create_app --factory --host 0.0.0.0 --port 8000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Streamlit dashboard - chat UI + routing transparency + ClickHouse chart.
+  # Talks to the chat backend over the compose network (CHAT_API_URL).
+  # ---------------------------------------------------------------------------
+  dashboard:
+    image: commit-pulse-app:latest
+    build:
+      context: .
+    container_name: cp-dashboard
+    depends_on:
+      chat:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      CHAT_API_URL: http://chat:8000
+      CLICKHOUSE_HOST: clickhouse
+      PYTHONPATH: /app
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command: streamlit run services/dashboard.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
     restart: unless-stopped
 
 volumes:
