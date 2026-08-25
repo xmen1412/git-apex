@@ -7,7 +7,9 @@ with parameterized values; table/column names are hardcoded.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from contextlib import closing, contextmanager
+from functools import lru_cache
+from typing import Any, Iterator
 
 import chromadb
 import clickhouse_connect
@@ -21,6 +23,19 @@ from .llm_router import RouteDecision
 logger = logging.getLogger(__name__)
 
 MAX_LIMIT = 100
+
+
+@contextmanager
+def _pg_cursor(settings: Settings) -> Iterator[psycopg2.extras.RealDictCursor]:
+    """Yields a RealDictCursor and guarantees the connection is closed.
+
+    psycopg2's connection context manager only commits/rolls back the
+    transaction — it does NOT close the socket. ``closing`` does.
+    """
+    with closing(psycopg2.connect(settings.postgres_pooled_url)) as conn:
+        with conn:  # transaction scope (commit/rollback)
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                yield cur
 
 
 def _limit(params: dict[str, Any], default: int = 10) -> int:
@@ -117,10 +132,9 @@ def _relational_params(intent: str, params: dict[str, Any]) -> tuple:
 def execute_relational(settings: Settings, decision: RouteDecision) -> list[dict[str, Any]]:
     intent = decision.params["intent"]
     sql = _RELATIONAL_SQL[intent]
-    with psycopg2.connect(settings.postgres_pooled_url) as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, _relational_params(intent, decision.params))
-            return [dict(r) for r in cur.fetchall()]
+    with _pg_cursor(settings) as cur:
+        cur.execute(sql, _relational_params(intent, decision.params))
+        return [dict(r) for r in cur.fetchall()]
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +157,7 @@ _ANALYTICAL_SQL = {
                sum(additions) AS total_additions, sum(deletions) AS total_deletions
         FROM commit_metrics
         WHERE 1=1
+          {days_filter}
           {repo_filter}
         GROUP BY author, author_email
         ORDER BY commits DESC
@@ -154,6 +169,7 @@ _ANALYTICAL_SQL = {
                sum(files_count) AS total_files
         FROM commit_metrics
         WHERE 1=1
+          {days_filter}
           {repo_filter}
         GROUP BY repo
         ORDER BY commits DESC
@@ -168,47 +184,70 @@ def execute_analytical(settings: Settings, decision: RouteDecision) -> list[dict
     days = _days(decision.params)
     sql = _ANALYTICAL_SQL[intent]
     sql = sql.replace("{repo_filter}", "AND repo = {repo:String}" if repo else "")
-    if intent == "commits_per_day":
-        sql = sql.replace(
-            "{days_filter}",
-            "AND committed_at >= now() - INTERVAL {days:UInt32} DAY" if days else "",
-        )
+    sql = sql.replace(
+        "{days_filter}",
+        "AND committed_at >= now() - INTERVAL {days:UInt32} DAY" if days else "",
+    )
     parameters: dict[str, Any] = {"limit": _limit(decision.params)}
     if repo:
         parameters["repo"] = repo
     if days is not None:
         parameters["days"] = days
-    client = clickhouse_connect.get_client(
+    with closing(clickhouse_connect.get_client(
         host=settings.clickhouse_host,
         port=settings.clickhouse_port,
         username=settings.clickhouse_user,
         password=settings.clickhouse_password,
         database=settings.clickhouse_db,
-    )
-    result = client.query(sql, parameters=parameters)
-    return [dict(zip(result.column_names, row)) for row in result.result_rows]
+    )) as client:
+        result = client.query(sql, parameters=parameters)
+        return [dict(zip(result.column_names, row)) for row in result.result_rows]
 
 
 # ---------------------------------------------------------------------------
 # Semantic -> Chroma (top-k vector search + optional metadata filter)
 # ---------------------------------------------------------------------------
 
-def _chroma_collection(settings: Settings):
-    client = chromadb.HttpClient(host=settings.chroma_host, port=settings.chroma_port)
+@lru_cache(maxsize=1)
+def _chroma_collection_cached(host: str, port: int, name: str):
+    client = chromadb.HttpClient(host=host, port=port)
     return client.get_or_create_collection(
-        name=settings.chroma_collection,
+        name=name,
         embedding_function=SentenceTransformerEmbeddingFunction(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         ),
     )
 
 
-def _semantic_query(settings: Settings, query_text: str, repo: str | None, limit: int) -> list[dict[str, Any]]:
+def _chroma_collection(settings: Settings):
+    return _chroma_collection_cached(
+        settings.chroma_host, settings.chroma_port, settings.chroma_collection
+    )
+
+
+def _semantic_query(
+    settings: Settings,
+    query_text: str,
+    repo: str | None,
+    limit: int,
+    file_path: str | None = None,
+) -> list[dict[str, Any]]:
     collection = _chroma_collection(settings)
+    conditions: list[dict[str, Any]] = []
+    if repo:
+        conditions.append({"repo": repo})
+    if file_path:
+        conditions.append({"paths": {"$contains": file_path}})
+    if len(conditions) > 1:
+        where: dict[str, Any] | None = {"$and": conditions}
+    elif conditions:
+        where = conditions[0]
+    else:
+        where = None
     result = collection.query(
         query_texts=[query_text],
         n_results=limit,
-        where={"repo": repo} if repo else None,
+        where=where,
     )
     hits = []
     for sha, meta, dist, doc in zip(
@@ -230,6 +269,7 @@ def execute_semantic(settings: Settings, decision: RouteDecision) -> list[dict[s
         settings,
         query_text=decision.params.get("query_text") or "",
         repo=decision.params.get("repo"),
+        file_path=decision.params.get("file_path"),
         limit=_limit(decision.params),
     )
 
@@ -249,22 +289,21 @@ def execute_chained(settings: Settings, decision: RouteDecision) -> dict[str, An
     if not shas:
         return {"candidates": [], "details": []}
 
-    with psycopg2.connect(settings.postgres_pooled_url) as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT c.sha, c.repo, COALESCE(a.username, a.name, a.email) AS author,
-                       c.message, c.committed_at, c.url,
-                       f.path, f.change_type, f.additions, f.deletions
-                FROM commits c
-                JOIN authors a ON a.id = c.author_id
-                LEFT JOIN files_changed f ON f.commit_sha = c.sha
-                WHERE c.sha = ANY(%s)
-                ORDER BY c.committed_at DESC
-                """,
-                (shas,),
-            )
-            details = [dict(r) for r in cur.fetchall()]
+    with _pg_cursor(settings) as cur:
+        cur.execute(
+            """
+            SELECT c.sha, c.repo, COALESCE(a.username, a.name, a.email) AS author,
+                   c.message, c.committed_at, c.url,
+                   f.path, f.change_type, f.additions, f.deletions
+            FROM commits c
+            JOIN authors a ON a.id = c.author_id
+            LEFT JOIN files_changed f ON f.commit_sha = c.sha
+            WHERE c.sha = ANY(%s)
+            ORDER BY c.committed_at DESC
+            """,
+            (shas,),
+        )
+        details = [dict(r) for r in cur.fetchall()]
     return {"candidates": candidates, "details": details}
 
 
@@ -280,5 +319,46 @@ EXECUTORS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Param validation — the router picked an intent but may not have supplied
+# the params that intent needs. Missing params must surface as a clarification,
+# not as an empty result ("no data") or a 502.
+# ---------------------------------------------------------------------------
+
+REQUIRED_PARAMS: dict[str, tuple[str, ...]] = {
+    # relational
+    "commits_by_file": ("file_path",),
+    "commits_by_repo": ("repo",),
+    "commits_by_author": ("author",),
+    "commit_detail": ("sha",),
+    "list_tables": (),
+    # analytical — all optional (bare aggregates are meaningful)
+    "commits_per_day": (),
+    "most_active_authors": (),
+    "churn_by_repo": (),
+    # semantic / chained
+    "semantic_search": ("query_text",),
+    "chained_search": ("query_text",),
+}
+
+
+class NeedsClarification(Exception):
+    """Router picked an intent but didn't supply the params it needs."""
+
+    def __init__(self, intent: str, missing: list[str]):
+        self.intent = intent
+        self.missing = missing
+        super().__init__(f"{intent} needs: {', '.join(missing)}")
+
+
+def validate_params(decision: RouteDecision) -> None:
+    intent = decision.params.get("intent")
+    required = REQUIRED_PARAMS.get(intent, ())
+    missing = [p for p in required if not str(decision.params.get(p) or "").strip()]
+    if missing:
+        raise NeedsClarification(intent, missing)
+
+
 def execute(decision: RouteDecision, settings: Settings) -> Any:
+    validate_params(decision)
     return EXECUTORS[decision.route](settings, decision)

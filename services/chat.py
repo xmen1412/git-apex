@@ -9,10 +9,19 @@ from pydantic import BaseModel, Field
 
 from commit_pulse.config import get_settings
 from commit_pulse.llm_router import route_question, summarize
-from commit_pulse.query_executors import execute
+from commit_pulse.pre_router import pre_route
+from commit_pulse.query_executors import execute, NeedsClarification
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+_PARAM_PROMPTS = {
+    "file_path": "which file?",
+    "repo": "which repo?",
+    "author": "which author?",
+    "sha": "which commit SHA?",
+    "query_text": "what should I search for?",
+}
 
 
 class ChatRequest(BaseModel):
@@ -34,10 +43,19 @@ def create_app() -> FastAPI:
     def chat(req: ChatRequest):
         if not settings.llm_api_key:
             raise HTTPException(status_code=503, detail="LLM_API_KEY not configured")
-        decision = route_question(req.question, settings)
+        decision = pre_route(req.question) or route_question(req.question, settings)
         logger.info("route=%s intent=%s reasoning=%s", decision.route, decision.params.get("intent"), decision.reasoning)
         try:
             data = execute(decision, settings)
+        except NeedsClarification as exc:
+            asks = " ".join(_PARAM_PROMPTS.get(m, m) for m in exc.missing)
+            return ChatResponse(
+                answer=f"I need a bit more to answer that — {asks}",
+                route=decision.route,
+                reasoning=decision.reasoning,
+                params=decision.params,
+                data=None,
+            )
         except Exception as exc:
             logger.exception("query execution failed")
             raise HTTPException(status_code=502, detail=f"query execution failed: {exc}") from exc

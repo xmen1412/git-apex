@@ -98,15 +98,6 @@ def route_question(question: str, settings: Settings) -> RouteDecision:
     params = parsed.get("params") or {}
     params.setdefault("query_text", question)
 
-    # Some short Indonesian content questions are consistently interpreted by
-    # the model as a literal file lookup. Route them to vector search instead.
-    question_lower = question.lower()
-    if route == "relational" and params.get("intent") == "commits_by_file":
-        content_words = ("apa isi", "isi dari", "content", "terkait", "related to")
-        if any(word in question_lower for word in content_words):
-            route = "semantic"
-            params["intent"] = "semantic_search"
-            params.pop("file_path", None)
     # Enforce whitelist: intent must belong to the chosen route.
     intent = params.get("intent")
     if intent not in ROUTE_INTENTS[route]:

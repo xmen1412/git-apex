@@ -108,6 +108,46 @@ Catatan: service `dashboard` di docker-compose (port 8501), berbicara dengan `ch
 - [x] Jawaban jujur untuk "would you actually build it this way at this scale?" → tidak, fan-out untuk demonstrasi pola
 - [x] Diagram arsitektur + cara menjalankan demo end-to-end
 
+## Fase 3 — Hardening (dari IMPROVEMENTS.md)
+
+Perbaikan bug + robustness, urut sesuai prioritas di `IMPROVEMENTS.md`.
+
+### 3.1 BUG 1 — connection leak tiap request
+- [x] `psycopg2` context manager tidak menutup socket → wrap dengan `closing()` via helper `_pg_cursor` di `commit_pulse/query_executors.py`
+- [x] ClickHouse client `execute_analytical` ditutup dengan `closing()`
+- [x] Chroma collection di-cache (`@lru_cache` pada `_chroma_collection_cached`) — tidak rebuild HttpClient + embedding function tiap query
+
+### 3.2 BUG 2 — `days` diabaikan di 2 intent analytical
+- [x] `{days_filter}` ditambahkan ke ketiga intent analytical (`commits_per_day`, `most_active_authors`, `churn_by_repo`)
+- [x] Filter `days` diterapkan seragam di `execute_analytical` (bukan hanya `commits_per_day`)
+- [x] `_days()` tetap `None` saat tak disebut (tidak ada hidden window)
+
+### 3.3 FIX 3 — param validation (`NeedsClarification`)
+- [x] `REQUIRED_PARAMS` (whitelist param wajib per intent) + `validate_params()` di `query_executors.py`
+- [x] `NeedsClarification` exception → `chat.py` menangkap sebelum generic `except` dan membalas klarifikasi (200, bukan 502)
+- [x] `_PARAM_PROMPTS` untuk pesan klarifikasi ramah (which file? / which repo? / ...)
+
+### 3.4 FIX 4 — eval set
+- [x] `tests/test_eval_offline.py` — deterministik, jalan di CI (param validation + self-enforcing whitelist)
+- [x] `tests/test_eval_routing.py` — live routing eval, di-skip kecuali `RUN_LIVE_EVAL=1` (16 kasus + days extraction)
+
+### 3.5 FIX 5 — deterministic pre-router
+- [x] `commit_pulse/pre_router.py` — rule-based routing (`list_tables`, `who changed <file>`, content→semantic)
+- [x] Rule yang match tapi param tak bisa di-extract → decline ke LLM
+- [x] `chat.py`: `pre_route(req.question) or route_question(...)`
+- [x] Hardcoded Indonesian override di `llm_router.py` dihapus (digantikan rule semantic bilingual)
+- [x] `tests/test_pre_router.py` (6 test)
+
+### 3.6 FIX 6 — semantic file filtering
+- [x] `chroma_sink.py` menyimpan `paths` sebagai metadata array (guard empty list)
+- [x] `query_executors.py` filter `where={"paths": {"$contains": file_path}}` + kombinasi `$and` dengan `repo`
+- [x] `services/backfill.py --rebuild-chroma` — re-index Chroma dari Postgres (source of truth, tanpa GitHub API)
+
+### 3.7 FIX 7 — structured outputs probe
+- [x] `scripts/probe_structured_outputs.py` — probe dukungan `json_schema` strict sebelum commit desain
+
+Catatan: 43 test lolos (17 live-eval di-skip tanpa `RUN_LIVE_EVAL`). `--rebuild-chroma` perlu dijalankan sekali setelah deploy agar koleksi lama mendapat field `paths`.
+
 ---
 
 ## Referensi cepat

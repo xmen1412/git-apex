@@ -24,15 +24,21 @@ class ChromaSink:
 
     def upsert_commit(self, event: CommitEvent) -> None:
         document = self._build_document(event)
+        paths = [f.path for f in event.files]
+        metadata = {
+            "repo": event.repo,
+            "sha": event.sha,
+            "author": event.author_username or event.author_email or "unknown",
+            "committed_at": event.committed_at.isoformat(),
+        }
+        # Chroma array metadata cannot be empty — skip the field entirely
+        # for a commit with no files rather than passing [].
+        if paths:
+            metadata["paths"] = paths
         self.collection.upsert(
             ids=[event.sha],
             documents=[document],
-            metadatas=[{
-                "repo": event.repo,
-                "sha": event.sha,
-                "author": event.author_username or event.author_email or "unknown",
-                "committed_at": event.committed_at.isoformat(),
-            }],
+            metadatas=[metadata],
         )
         logger.info("upserted commit %s into chroma", event.sha)
 

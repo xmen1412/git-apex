@@ -97,11 +97,10 @@ def test_route_question_fallback_on_unknown_route():
 
 
 def test_route_question_content_lookup_uses_semantic_search():
-    payload = {"route": "relational", "reasoning": "file lookup",
-               "params": {"intent": "commits_by_file", "file_path": "hello-world"}}
-    with patch("commit_pulse.llm_router._client") as mk:
-        mk.return_value.chat.completions.create.return_value = mock_llm_response(payload)
-        d = route_question("apa isi hello-world", make_settings())
+    from commit_pulse.pre_router import pre_route
+
+    d = pre_route("apa isi hello-world")
+    assert d is not None
     assert d.route == "semantic"
     assert d.params["intent"] == "semantic_search"
     assert "file_path" not in d.params
