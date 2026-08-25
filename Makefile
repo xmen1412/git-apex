@@ -17,10 +17,11 @@ ps:
 # Applies the Postgres schema to Neon. Uses the DIRECT (unpooled) URL —
 # the pooled endpoint runs PgBouncer in transaction mode, which breaks
 # prepared statements and can time out on migrations.
-# Requires psql installed locally.
+# Runs psql via a throwaway container (no local install needed).
 schema:
 	@set -a && . ./.env && set +a && \
-		psql "$$POSTGRES_DIRECT_URL" -f infra/postgres/01-schema.sql
+		docker run --rm -i postgres:16-alpine \
+			psql "$$POSTGRES_DIRECT_URL" -f - < infra/postgres/01-schema.sql
 
 # Confirms every service is actually reachable and schemas exist.
 verify:
@@ -30,7 +31,9 @@ verify:
 	@docker compose run --rm --entrypoint sh minio-init -c \
 		'mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD >/dev/null && mc ls local'
 	@echo "--- Neon Postgres tables ---"
-	@set -a && . ./.env && set +a && psql "$$POSTGRES_DIRECT_URL" -c '\dt'
+	@set -a && . ./.env && set +a && \
+		docker run --rm -i postgres:16-alpine \
+			psql "$$POSTGRES_DIRECT_URL" -c '\dt'
 	@echo "--- ClickHouse tables ---"
 	@docker compose exec clickhouse clickhouse-client \
 		--user $${CLICKHOUSE_USER:-commitpulse} --password $${CLICKHOUSE_PASSWORD:-commitpulse} \
