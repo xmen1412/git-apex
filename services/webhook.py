@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from kafka.errors import KafkaError
 
 from commit_pulse.config import get_settings
 from commit_pulse.kafka_io import make_producer, publish_push_payload
@@ -24,7 +26,16 @@ def verify_signature(payload: bytes, signature: str | None, secret: str) -> bool
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        producer = make_producer(settings)
+        producer = None
+        for attempt in range(10):
+            try:
+                producer = make_producer(settings)
+                break
+            except KafkaError:
+                logger.warning("kafka not ready (attempt %d/10), retrying...", attempt + 1)
+                await asyncio.sleep(5)
+        if producer is None:
+            raise RuntimeError("kafka is unreachable after 10 attempts")
         app.state.producer = producer
         yield
         producer.close()
