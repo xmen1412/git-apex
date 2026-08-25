@@ -66,6 +66,7 @@ def _days(params: dict[str, Any], default: int | None = None) -> int | None:
 _RELATIONAL_SQL = {
     "commits_by_file": """
         SELECT c.sha, c.repo, COALESCE(a.username, a.name, a.email) AS author,
+               a.username AS author_username, a.email AS author_email,
                c.message, c.committed_at, f.change_type, f.additions, f.deletions
         FROM files_changed f
         JOIN commits c ON c.sha = f.commit_sha
@@ -76,6 +77,7 @@ _RELATIONAL_SQL = {
     """,
     "commits_by_repo": """
         SELECT c.sha, c.repo, COALESCE(a.username, a.name, a.email) AS author,
+               a.username AS author_username, a.email AS author_email,
                c.message, c.committed_at, c.source
         FROM commits c
         JOIN authors a ON a.id = c.author_id
@@ -85,6 +87,7 @@ _RELATIONAL_SQL = {
     """,
     "commits_by_author": """
         SELECT c.sha, c.repo, COALESCE(a.username, a.name, a.email) AS author,
+               a.username AS author_username, a.email AS author_email,
                c.message, c.committed_at
         FROM commits c
         JOIN authors a ON a.id = c.author_id
@@ -94,6 +97,7 @@ _RELATIONAL_SQL = {
     """,
     "commit_detail": """
         SELECT c.sha, c.repo, COALESCE(a.username, a.name, a.email) AS author,
+               a.username AS author_username, a.email AS author_email,
                c.message, c.committed_at, c.url, c.source,
                f.path, f.change_type, f.additions, f.deletions, f.patch
         FROM commits c
@@ -257,6 +261,8 @@ def _semantic_query(
             "sha": sha,
             "repo": meta.get("repo"),
             "author": meta.get("author"),
+            "author_username": meta.get("author_username"),
+            "author_email": meta.get("author_email"),
             "committed_at": meta.get("committed_at"),
             "distance": round(dist, 4),
             "excerpt": doc[:500],
@@ -293,6 +299,7 @@ def execute_chained(settings: Settings, decision: RouteDecision) -> dict[str, An
         cur.execute(
             """
             SELECT c.sha, c.repo, COALESCE(a.username, a.name, a.email) AS author,
+                   a.username AS author_username, a.email AS author_email,
                    c.message, c.committed_at, c.url,
                    f.path, f.change_type, f.additions, f.deletions
             FROM commits c

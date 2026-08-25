@@ -29,6 +29,8 @@ class ChromaSink:
             "repo": event.repo,
             "sha": event.sha,
             "author": event.author_username or event.author_email or "unknown",
+            "author_username": event.author_username or "",
+            "author_email": event.author_email or "",
             "committed_at": event.committed_at.isoformat(),
         }
         # Chroma array metadata cannot be empty — skip the field entirely

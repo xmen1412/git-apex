@@ -38,8 +38,9 @@ demonstration artifact, not a scale recommendation.
               ▼               ▼                 ▼                   ▼
             MinIO      Neon Postgres       ClickHouse            Chroma
           (raw JSON    (commits, authors,  (commit_metrics)   (embeddings:
-          archive,     files_changed                          message+diff,
-          replayable    + patch text)                            all-MiniLM-L6-v2)
+           archive,     files_changed                          message+diff,
+           replayable    + patch text)                     metadata + paths,
+                                                               all-MiniLM-L6-v2)
               │               │                 │                   │
               └───────────────┴────────┬────────┴───────────────────┘
                                        ▼
@@ -97,6 +98,18 @@ docker compose run --rm --no-deps \
   processor python services/backfill.py octocat/Hello-World --limit 20 --delay 1
 ```
 
+Re-index existing Chroma documents from Neon after enabling semantic file
+filtering. This does not call the GitHub API:
+
+```bash
+docker compose run --rm --no-deps \
+  chat python services/backfill.py --rebuild-chroma
+```
+
+Use `chat` or `processor` for this command because they set the compose
+network values `CHROMA_HOST=chroma` and `CHROMA_PORT=8000`. The host values
+(`localhost:8001`) are only for commands running outside Docker.
+
 ### Auto-watch all your repos (live ingestion)
 
 A GitHub token can read any repo it's granted access to, but GitHub webhooks
@@ -132,6 +145,9 @@ route, the router's reasoning, the raw data, and the natural-language answer.
 Or open the dashboard at http://localhost:8501.
 
 Run tests: `docker compose run --rm --no-deps webhook python -m pytest tests/ -q`
+The current suite has 43 passing tests. Live routing evaluation is skipped by
+default; enable it with `RUN_LIVE_EVAL=1` when LLM calls and their cost are
+acceptable.
 
 ## Stack notes
 
@@ -169,8 +185,7 @@ explicit `ALTER` statements against Neon.
 
 ## Improvements so far
 
-Hardening done after the first end-to-end demo, all covered by tests
-(`tests/test_chat.py` + `tests/test_repo_watcher.py`, 32 tests):
+Hardening completed after the first end-to-end demo:
 
 - **Router output parsing** — the Zen API wraps JSON in ```` ```json ````
   fences even with `response_format: json_object`; `_parse_json_object()`
@@ -184,14 +199,34 @@ Hardening done after the first end-to-end demo, all covered by tests
 - **No hidden time window** — `commits_per_day` used to silently default
   to the last 30 days (confusing with old backfilled commits). Now `days`
   is only applied when the user actually mentions a time range.
-- **`author_email` in ClickHouse** — added to `commit_metrics` (schema,
-  sink, and `most_active_authors` grouping); existing rows backfilled via
-  `ALTER TABLE ... UPDATE` from Neon.
+- **Author identity fields** — `author_email` is available in ClickHouse,
+  relational query results, chained results, and Chroma metadata. Relational
+  queries join Neon `authors` and return both `author_username` and
+  `author_email`, so questions such as "apa email dari xmen1412" use stored
+  data instead of guessing.
 - **Schema questions** — new `list_tables` intent answers "what tables are
   in Neon?" from `information_schema`.
-- **Deterministic override** — obvious content questions in Indonesian
-  ("apa isi …", "terkait …") are forced to semantic search instead of a
-  literal filename lookup.
+- **Deterministic pre-router** — obvious table questions, file-change
+  questions, and content questions in Indonesian/English are routed before
+  the LLM. A rule that cannot extract its required parameter declines safely
+  to the LLM.
+- **Connection lifecycle** — Postgres connections and ClickHouse clients are
+  closed after each query; the Chroma collection and embedding function are
+  cached instead of rebuilt for every request.
+- **Analytical time filters** — explicit `days` filters now apply consistently
+  to all analytical intents, while unspecified questions still query full
+  history.
+- **Clarification handling** — missing required parameters return a normal
+  clarification response instead of an empty result or HTTP 502.
+- **Semantic file filtering** — Chroma stores non-empty `paths` metadata
+  arrays and supports exact file-path filtering with `$contains`. Existing
+  documents can be rebuilt from Neon using `--rebuild-chroma`.
+- **Routing evaluation** — offline validation tests run without LLM cost;
+  optional English/Indonesian live routing cases run only with
+  `RUN_LIVE_EVAL=1`.
+- **Structured-output probe** — `scripts/probe_structured_outputs.py` checks
+  whether the configured Zen model supports strict JSON schema before the
+  router is redesigned around it.
 - **One-command stack** — webhook, processor, chat, and dashboard are all
   `docker compose` services (`docker compose up -d`), replacing the manual
   `docker run` commands.
@@ -202,21 +237,27 @@ Hardening done after the first end-to-end demo, all covered by tests
   smee-client` terminal. Pushing to any of the 14 registered repos now flows
   into the pipeline without touching GitHub settings by hand.
 
-## Known limitations / future improvements
+## Remaining limitations / future improvements
 
-Notes from a routing-mistake review — deliberately **not fixed yet**, kept
-as a roadmap:
+Recommended next steps, ordered by value for a production-like deployment:
 
-- **Structured Outputs / function calling** — JSON mode guarantees valid
-  JSON, not correct enum values. Constrain `route`/`intent` via a strict
-  schema (needs testing whether Zen supports it for `claude-haiku-4-5`).
-- **Deterministic pre-router** — route obvious patterns ("table/schema
-  Neon", "siapa mengubah file X") with rules *before* calling the LLM;
-  today every question costs an LLM call.
-- **Param validation** — required params per intent (`file_path`, `repo`,
-  `author`, `sha`) should return `needs_clarification` instead of silently
-  falling back to a wrong query.
-- **Semantic file filtering** — Chroma metadata has no `paths` field, so
-  semantic search can't filter by file; add it at index time.
-- **Eval set** — ~20 Indonesian/English questions as a regression suite for
-  routing accuracy.
+- **Production resilience** — add bounded retries and timeouts for Neon,
+  Chroma, ClickHouse, GitHub, and Zen, plus clear upstream error responses.
+- **Observability** — expose request latency, selected route, query duration,
+  ingestion lag, Kafka failures, and per-sink error counters. Add a correlation
+  ID so one commit can be traced across webhook, Kafka, processor, and sinks.
+- **Reliable ingestion** — add a dead-letter topic and retry policy for poison
+  events instead of only logging failed Kafka messages. Persist processing
+  status so failed sink writes can be replayed selectively.
+- **Author identity normalization** — GitHub may expose privacy-protected
+  `noreply` addresses or different emails for the same person. Define a stable
+  identity policy and document privacy implications before exposing emails in a
+  public dashboard.
+- **Explicit author lookup intent** — add a dedicated `author_profile` intent
+  for username/email questions instead of relying on the broader
+  `commits_by_author` query and LLM summarization.
+- **Schema and contract tests** — verify result fields such as
+  `author_email` whenever the database schema or query templates change.
+- **Pagination and access control** — paginate large commit results, protect
+  `/chat` with authentication/rate limiting, and restrict repositories if the
+  dashboard is deployed publicly.
